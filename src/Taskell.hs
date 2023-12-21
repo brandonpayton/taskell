@@ -11,10 +11,11 @@ import Control.Lens ((^.))
 import Data.Time.Zones (TZ)
 
 import Brick
-import Brick.BChan               (BChan, newBChan, writeBChan)
-import Graphics.Vty              (Mode (BracketedPaste), defaultConfig, displayBounds, mkVty,
-                                  outputIface, setMode, supportsMode)
-import Graphics.Vty.Input.Events (Event (..))
+import Brick.BChan                (BChan, newBChan, writeBChan)
+import Graphics.Vty               (Mode (BracketedPaste), defaultConfig, displayBounds,
+                                   outputIface, setMode, supportsMode)
+import Graphics.Vty.CrossPlatform (mkVty)
+import Graphics.Vty.Input.Events  (Event (..))
 
 import qualified Control.FoldDebounce as Debounce
 
@@ -28,6 +29,7 @@ import Taskell.IO.Config               (Config, debugging, generateAttrMap, getB
 import Taskell.Types                   (ListIndex (..), TaskIndex (..))
 import Taskell.UI.Draw                 (chooseCursor, draw)
 import Taskell.UI.Types                (ResourceName (..))
+import System.IO (appendFile)
 
 type DebouncedMessage = (Lists, FilePath, TZ)
 
@@ -55,14 +57,22 @@ timer chan =
 store :: Config -> DebouncedMessage -> IO ()
 store config (ls, pth, tz) = writeData tz config ls pth
 
-next :: DebouncedWrite -> State -> EventM ResourceName (Next State)
-next send state =
+bptrace:: String -> EventM ResourceName State ()
+bptrace text = do
+    liftIO $ appendFile "/home/brandon/src/taskell/bptrace" (text ++ "\n")
+    return ()
+
+next :: DebouncedWrite -> State -> EventM ResourceName State ()
+next send state = do
     case state ^. io of
         Just ls -> do
+            bptrace "next send: Just ls"
             invalidateCache
             liftIO $ send (ls, state ^. path, state ^. timeZone)
-            Brick.continue $ Taskell.Events.State.continue state
-        Nothing -> Brick.continue state
+            put $ Taskell.Events.State.continue state
+        Nothing -> do
+            bptrace "next send: Nothing"
+            put state
 
 -- debouncing
 debounce :: Config -> State -> IO (DebouncedWrite, Trigger)
@@ -79,20 +89,20 @@ debounce config initial = do
     pure (send, trigger)
 
 -- cache clearing
-clearCache :: State -> EventM ResourceName ()
+clearCache :: State -> EventM ResourceName State ()
 clearCache state = do
     let (ListIndex li, TaskIndex ti) = state ^. current
     invalidateCacheEntry (RNList li)
     invalidateCacheEntry (RNTask (ListIndex li, TaskIndex ti))
 
-clearAllTitles :: State -> EventM ResourceName ()
+clearAllTitles :: State -> EventM ResourceName State ()
 clearAllTitles state = do
     let count = length (state ^. lists)
     let range = [0 .. (count - 1)]
     traverse_ (invalidateCacheEntry . RNList) range
     traverse_ (invalidateCacheEntry . RNTask . (, TaskIndex (-1)) . ListIndex) range
 
-clearList :: State -> EventM ResourceName ()
+clearList :: State -> EventM ResourceName State ()
 clearList state = do
     let (ListIndex list, _) = state ^. current
     let count = countCurrent state
@@ -100,7 +110,7 @@ clearList state = do
     invalidateCacheEntry $ RNList list
     traverse_ (invalidateCacheEntry . RNTask . (,) (ListIndex list) . TaskIndex) range
 
-clearDue :: State -> EventM ResourceName ()
+clearDue :: State -> EventM ResourceName State ()
 clearDue state =
     case state ^. mode of
         Modal (Due dues _) -> do
@@ -110,48 +120,65 @@ clearDue state =
 
 -- event handling
 handleVtyEvent ::
-       (DebouncedWrite, Trigger) -> ActionSets -> State -> Event -> EventM ResourceName (Next State)
-handleVtyEvent (send, trigger) actions previousState e = do
+       (DebouncedWrite, Trigger) -> ActionSets -> Event -> EventM ResourceName State ()
+handleVtyEvent (send, trigger) actions e = do
+    -- TODO: Is this where it breaks because it isn't totally "previous" any more?
+    previousState <- get
+    bptrace $ "handleVtyEvent: previous: " ++ (show $ previousState ^. mode)
     let state = event actions e previousState
+    bptrace $ "handleVtyEvent: current: " ++ (show $ state ^. mode)
+    -- TODO: SHould this be in `next send` instead?
     when (previousState ^. searchTerm /= state ^. searchTerm) invalidateCache
     case previousState ^. mode of
         (Modal MoveTo)           -> clearAllTitles previousState
         (Insert ITask ICreate _) -> clearList previousState
         _                        -> pure ()
     case state ^. mode of
-        Shutdown -> liftIO (Debounce.close trigger) *> Brick.halt state
+        Shutdown -> liftIO (Debounce.close trigger) *> Brick.halt
         (Modal Due {}) -> clearDue state *> next send state
         (Modal MoveTo) -> clearAllTitles state *> next send state
         (Insert ITask ICreate _) -> clearList state *> next send state
         _ -> clearCache previousState *> clearCache state *> next send state
 
-getHeight :: EventM ResourceName Int
+    saved <- get
+    bptrace $ "handleVtyEvent: saved: " ++ (show $ state ^. mode)
+
+getHeight :: EventM ResourceName State Int
 getHeight = snd <$> (liftIO . displayBounds =<< outputIface <$> getVtyHandle)
 
 handleEvent ::
        (DebouncedWrite, Trigger)
     -> ActionSets
-    -> State
     -> BrickEvent ResourceName TaskellEvent
-    -> EventM ResourceName (Next State)
-handleEvent _ _ state (AppEvent Tick) = do
+    -> EventM ResourceName State ()
+handleEvent _ _ (AppEvent Tick) = do
+    state <- get
     t <- liftIO getCurrentTime
-    Brick.continue $ setTime t state
-handleEvent _ _ state (VtyEvent (EvResize _ _)) = do
+    put $ setTime t state
+handleEvent _ _ (VtyEvent (EvResize _ _)) = do
     invalidateCache
+    state <- get
     h <- getHeight
-    Brick.continue (setHeight h state)
-handleEvent db actions state (VtyEvent ev) = handleVtyEvent db actions state ev
-handleEvent _ _ state _ = Brick.continue state
+    put $ setHeight h state
+handleEvent db actions (VtyEvent ev) = do
+    previousState <- get
+    bptrace $ "handleEvent: previous: " ++ (show $ previousState ^. mode)
+    handleVtyEvent db actions ev
+    state <- get
+    bptrace $ "handleEvent: current: " ++ (show $ state ^. mode)
+handleEvent _ _ _ = do
+    bptrace "nothing for this event"
+    return ()
 
 -- | Runs when the app starts
 --   Adds paste support
-appStart :: State -> EventM ResourceName State
-appStart state = do
+appStart :: EventM ResourceName State ()
+appStart = do
+    state <- get
     output <- outputIface <$> getVtyHandle
     when (supportsMode output BracketedPaste) . liftIO $ setMode output BracketedPaste True
     h <- getHeight
-    pure (setHeight h state)
+    put $ setHeight h state
 
 -- | Sets up Brick
 go :: Config -> State -> IO ()

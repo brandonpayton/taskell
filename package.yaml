@@ -80,6 +80,7 @@ library:
   - time
   - tz
   - vty
+  - vty-crossplatform
 
 executables:
   taskell:
